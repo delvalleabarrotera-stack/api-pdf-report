@@ -1,11 +1,11 @@
-import json
-import fitz  # PyMuPDF
+import re
+import fitz
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="PDF → JSON Extractor (Free)", version="1.0.0")
+app = FastAPI(title="PDF → JSON Extractor (Free)", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,58 +14,441 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────
 
-def extract_tables(page):
-    """Try to extract tables from a page."""
-    tables = []
+def clean(val):
+    """Return None for N/A / NA / dash values."""
+    if val is None:
+        return None
+    v = str(val).strip()
+    if v.upper() in ("N/A", "NA", "-", "", "NONE"):
+        return None
+    return v
+
+def to_num(val):
+    """Parse dollar / numeric strings to float."""
+    if val is None:
+        return None
+    v = str(val).strip().replace("$", "").replace(",", "")
     try:
-        found = page.find_tables()
-        for table in found.tables:
-            data = table.extract()
-            if data:
-                tables.append(data)
-    except Exception:
-        pass
-    return tables
+        return float(v)
+    except ValueError:
+        return None
+
+def lines(text):
+    return [l.strip() for l in text.splitlines() if l.strip()]
 
 
-def extract_page(page, page_num):
-    """Extract all content from a single page."""
-    # Plain text
-    text = page.get_text("text").strip()
+# ─────────────────────────────────────────
+# Full-text extraction
+# ─────────────────────────────────────────
 
-    # Text blocks with position info
-    blocks_raw = page.get_text("blocks")
-    blocks = []
-    for b in blocks_raw:
-        x0, y0, x1, y1, content, block_no, block_type = b
-        if content.strip():
-            blocks.append({
-                "block": block_no,
-                "type": "text" if block_type == 0 else "image",
-                "x0": round(x0, 1),
-                "y0": round(y0, 1),
-                "x1": round(x1, 1),
-                "y1": round(y1, 1),
-                "text": content.strip(),
+def get_full_text(doc):
+    parts = []
+    for page in doc:
+        t = page.get_text("text").strip()
+        if t:
+            parts.append(t)
+    return "\n\n".join(parts)
+
+
+# ─────────────────────────────────────────
+# Section splitter
+# ─────────────────────────────────────────
+
+SECTION_HEADERS = [
+    "REPORT SUMMARY",
+    "PERSONAL INFORMATION",
+    "CREDIT SCORE",
+    "ADDRESS HISTORY",
+    "EMPLOYMENT HISTORY",
+    "TRADE ACCOUNTS",
+    "INQUIRIES",
+    "COLLECTIONS",
+]
+
+def split_sections(full_text):
+    """Split full text into named sections."""
+    pattern = "(" + "|".join(re.escape(h) for h in SECTION_HEADERS) + ")"
+    parts = re.split(pattern, full_text)
+    sections = {}
+    current = "HEADER"
+    buf = []
+    for part in parts:
+        if part in SECTION_HEADERS:
+            sections[current] = "\n".join(buf).strip()
+            current = part
+            buf = []
+        else:
+            buf.append(part)
+    sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+# ─────────────────────────────────────────
+# Parsers per section
+# ─────────────────────────────────────────
+
+def parse_header(text):
+    """Extract name and date from the document header."""
+    result = {}
+    for line in lines(text):
+        if "DATE PULLED:" in line:
+            result["date_pulled"] = line.replace("DATE PULLED:", "").strip()
+        elif line and not result.get("name"):
+            result["name"] = line
+    return result
+
+
+def parse_report_summary(text):
+    """Parse key:value pairs from the summary block."""
+    mapping = {
+        "INQUIRIES": "inquiries",
+        "NEWEST OPEN": "newest_open",
+        "COLLECTIONS": "collections",
+        "OLDEST OPEN": "oldest_open",
+        "PUBLIC RECORDS": "public_records",
+        "MONTHLY PAYMENTS": "monthly_payments",
+        "30/60/90": "delinquency_30_60_90",
+        "BALANCE": "balance",
+        "ACCOUNTS": "accounts_total",
+        "CREDIT LIMIT": "credit_limit",
+        "OPEN ACCOUNTS": "open_accounts",
+        "AVAILABLE CREDIT": "available_credit",
+        "CLOSED ACCOUNTS": "closed_accounts",
+        "UTILIZATION RATIO": "utilization_ratio",
+    }
+    result = {}
+    ls = lines(text)
+    i = 0
+    while i < len(ls):
+        for key, field in mapping.items():
+            if ls[i].upper().startswith(key):
+                # value is next line or same line after colon
+                raw = ls[i].split(":", 1)[-1].strip() if ":" in ls[i] else ""
+                if not raw and i + 1 < len(ls):
+                    raw = ls[i + 1]
+                    i += 1
+                result[field] = clean(raw)
+                break
+        i += 1
+    return result
+
+
+def parse_personal_info(text):
+    ls = lines(text)
+    result = {}
+    for i, line in enumerate(ls):
+        u = line.upper()
+        if u.startswith("NAME:"):
+            result["name"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+        elif u.startswith("EMAIL:"):
+            result["email"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+        elif u.startswith("DOB:"):
+            result["date_of_birth"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+        elif u.startswith("SOCIAL:"):
+            result["ssn"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+        elif u.startswith("AKA:"):
+            result["aka"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+        elif u.startswith("PHONE:"):
+            result["phone"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+    # fallback: parse inline pairs
+    if not result:
+        combined = " ".join(ls)
+        for pat, field in [
+            (r"NAME:\s*([A-Z ]+?)(?=EMAIL:|DOB:|$)", "name"),
+            (r"DOB:\s*([\d-]+)", "date_of_birth"),
+            (r"SOCIAL:\s*([\d-]+)", "ssn"),
+            (r"EMAIL:\s*(\S+)", "email"),
+            (r"PHONE:\s*(\S+)", "phone"),
+        ]:
+            m = re.search(pat, combined)
+            if m:
+                result[field] = clean(m.group(1).strip())
+    return result
+
+
+def parse_credit_score(text):
+    scores = []
+    ls = lines(text)
+    # skip header row
+    i = 0
+    while i < len(ls):
+        line = ls[i].upper()
+        if "FICO" in line or "VANTAGE" in line:
+            parts = ls[i].split()
+            model = parts[0] + (" " + parts[1] if len(parts) > 1 and parts[1].isdigit() else "")
+            score_val = None
+            reasons = []
+            j = i + 1
+            while j < len(ls):
+                if re.match(r"^\d{3}$", ls[j].strip()):
+                    score_val = int(ls[j].strip())
+                    j += 1
+                    break
+                # score might be on same line
+                m = re.search(r"\b(\d{3})\b", ls[i])
+                if m:
+                    score_val = int(m.group(1))
+                break
+            # collect reason codes until next model or end
+            while j < len(ls):
+                l = ls[j]
+                if "FICO" in l.upper() or "VANTAGE" in l.upper() or "N/A" == l.upper():
+                    break
+                if l and not l.upper().startswith("SCORE") and not l.upper().startswith("REASON") and not l.upper().startswith("NO SCORE"):
+                    reasons.append(l)
+                j += 1
+            scores.append({
+                "model": model.strip(),
+                "score": score_val,
+                "reason_codes": reasons if reasons else None,
             })
+            i = j
+        else:
+            i += 1
+    return scores
 
-    # Tables
-    tables = extract_tables(page)
 
-    # Images count
-    images = page.get_images(full=False)
+def parse_address_history(text):
+    addresses = []
+    ls = lines(text)
+    # skip header line
+    start = 0
+    for i, l in enumerate(ls):
+        if "STATUS" in l.upper() and "STREET" in l.upper():
+            start = i + 1
+            break
+    i = start
+    while i < len(ls):
+        l = ls[i].upper()
+        if l.startswith("CURRENT") or l.startswith("PREVIOUS"):
+            status = "CURRENT" if l.startswith("CURRENT") else "PREVIOUS"
+            parts = ls[i].split()
+            # parts: STATUS STREET... CITY STATE/ZIP DATE
+            # find date at end (MM-DD-YYYY)
+            date = None
+            if re.match(r"\d{2}-\d{2}-\d{4}", parts[-1]):
+                date = parts[-1]
+                parts = parts[:-1]
+            # find state/zip (CA XXXXXXX pattern)
+            state_zip = None
+            for j in range(len(parts)-1, 0, -1):
+                if re.match(r"[A-Z]{2}", parts[j-1]) and re.match(r"\d+", parts[j]):
+                    state_zip = parts[j-1] + " " + parts[j]
+                    parts = parts[:j-1]
+                    break
+            street_city = " ".join(parts[1:])  # remove STATUS
+            addresses.append({
+                "status": status,
+                "address": clean(street_city),
+                "state_zip": clean(state_zip),
+                "date_reported": clean(date),
+            })
+        i += 1
+    return addresses
+
+
+def parse_employment_history(text):
+    jobs = []
+    ls = lines(text)
+    start = 0
+    for i, l in enumerate(ls):
+        if "STATUS" in l.upper() and "NAME" in l.upper():
+            start = i + 1
+            break
+    for line in ls[start:]:
+        parts = line.split()
+        if not parts:
+            continue
+        status = parts[0].upper()
+        if status in ("CURRENT", "PREVIOUS"):
+            date = parts[-1] if re.match(r"\d{2}-\d{2}-\d{4}", parts[-1]) else None
+            occ_idx = -2 if date else -1
+            employer = " ".join(parts[1:occ_idx]) if len(parts) > 2 else None
+            jobs.append({
+                "status": status,
+                "employer": clean(employer),
+                "date_reported": clean(date),
+            })
+    return jobs
+
+
+def parse_trade_accounts(text):
+    """Parse repeating FURNISHER blocks from trade accounts."""
+    accounts = []
+
+    # Each account starts with a FURNISHER line
+    blocks = re.split(r"(?=\bFURNISHER\b)", text)
+
+    ACCOUNT_FIELDS = [
+        "reported_date", "closure_date", "acc_status", "acc_rating",
+        "acc_number", "pymt_history_start", "pymt_pattern", "remarks",
+        "sales_indicator", "acct_type", "portfolio_type", "pymt_frequency",
+        "responsibility", "date_of_opening", "terms", "last_pymt_date",
+        "org_loan_amt", "high_balance", "balance", "high_credit",
+        "credit_limit", "monthly_pymt", "actual_pymt", "past_due",
+        "last_activity_date", "recent_pymt", "deferred_date",
+        "bln_due_amt", "bln_due_date", "months_reviewed",
+        "delinquency_30_60_90", "max_delinquency_date",
+    ]
+
+    for block in blocks:
+        ls = [l.strip() for l in block.splitlines() if l.strip()]
+        if not ls or "FURNISHER" not in ls[0].upper():
+            continue
+
+        # Filter out payment pattern lines (sequences of numbers/letters like "9 5 5 4 3 C C C")
+        data_lines = [l for l in ls[1:] if not re.match(r"^[\d\s\w]{2,}$", l) or
+                      any(k in l.upper() for k in [
+                          "CLOSED", "OPEN", "ACCOUNT", "CREDIT", "REVOLVING",
+                          "INSTALLMENT", "INDIVIDUAL", "JOINT", "MONTHLY",
+                          "FURNISHER", "REQUIRED", "LENDER", "PURCHASED",
+                          "SIGNER", "CHARGE", "AUTO", "UNSECURED",
+                      ])]
+
+        acc = {}
+        i = 0
+        field_idx = 0
+
+        # Simple sequential parser: match non-pattern lines to fields in order
+        for line in data_lines:
+            if field_idx >= len(ACCOUNT_FIELDS):
+                break
+            field = ACCOUNT_FIELDS[field_idx]
+            # Skip payment pattern sequences
+            if re.match(r"^[0-9BCEUR ]{5,}$", line):
+                continue
+            val = clean(line)
+            # Try to parse numbers for amount fields
+            if field in ("org_loan_amt", "high_balance", "balance", "high_credit",
+                         "credit_limit", "monthly_pymt", "actual_pymt", "past_due",
+                         "recent_pymt", "bln_due_amt"):
+                acc[field] = to_num(val) if val else None
+            elif field == "months_reviewed":
+                try:
+                    acc[field] = int(val) if val else None
+                except (ValueError, TypeError):
+                    acc[field] = None
+            else:
+                acc[field] = val
+            field_idx += 1
+
+        if acc:
+            accounts.append(acc)
+
+    return accounts
+
+
+def parse_inquiries(text):
+    inquiries = []
+    ls = lines(text)
+    start = 0
+    for i, l in enumerate(ls):
+        if "COMPANY" in l.upper() and "DATE" in l.upper():
+            start = i + 1
+            break
+    for line in ls[start:]:
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"\d{2}-\d{2}-\d{4}", parts[-2] if len(parts) >= 3 else parts[-1]):
+            # last token might be industry or date
+            date_idx = None
+            for j, p in enumerate(parts):
+                if re.match(r"\d{2}-\d{2}-\d{4}", p):
+                    date_idx = j
+                    break
+            if date_idx is None:
+                continue
+            company = " ".join(parts[:date_idx])
+            date = parts[date_idx]
+            industry = " ".join(parts[date_idx+1:]) if date_idx + 1 < len(parts) else None
+            inquiries.append({
+                "company": clean(company),
+                "date": clean(date),
+                "industry": clean(industry),
+            })
+    return inquiries
+
+
+def parse_collections(text):
+    collections = []
+    ls = lines(text)
+    # Skip header rows
+    start = 0
+    for i, l in enumerate(ls):
+        if "SUBSCRIBER" in l.upper() or "ORGN. CRED" in l.upper():
+            start = i + 1
+
+    # Group lines into collection entries (each starts with FURNISHER)
+    blocks = re.split(r"(?=\bFURNISHER\b)", "\n".join(ls[start:]))
+    for block in blocks:
+        bls = [l.strip() for l in block.splitlines() if l.strip()]
+        if not bls:
+            continue
+        col = {}
+        for line in bls:
+            u = line.upper()
+            if u in ("FURNISHER",):
+                continue
+            elif u in ("INDIVIDUAL", "JOINT"):
+                col["responsibility"] = line
+            elif u in ("RETAIL", "FINANCIAL", "MEDICAL", "UTILITY"):
+                col["creditor_type"] = line
+            elif u in ("INSTALLMENT", "REVOLVING", "OPEN"):
+                col["portfolio_type"] = line
+            elif "UNKNOWN" in u or "COLLECTION" in u:
+                col["account_type"] = line
+            elif re.match(r"\d{2}-\d{2}-\d{4}", line):
+                if "report_date" not in col:
+                    col["report_date"] = line
+                elif "assigned_date" not in col:
+                    col["assigned_date"] = line
+                elif "last_pymt_date" not in col:
+                    col["last_pymt_date"] = line
+            elif line.startswith("$"):
+                if "balance" not in col:
+                    col["balance"] = to_num(line)
+                else:
+                    col["original_amount"] = to_num(line)
+            elif line == "N/A":
+                pass
+        if col:
+            collections.append(col)
+    return collections
+
+
+# ─────────────────────────────────────────
+# Main parser
+# ─────────────────────────────────────────
+
+def parse_credit_report(full_text):
+    sections = split_sections(full_text)
+
+    header_text = sections.get("HEADER", "")
+    header = parse_header(header_text)
 
     return {
-        "page": page_num,
-        "width": round(page.rect.width, 1),
-        "height": round(page.rect.height, 1),
-        "text": text,
-        "blocks": blocks,
-        "tables": tables,
-        "image_count": len(images),
+        "report_info": {
+            "subject_name": header.get("name"),
+            "date_pulled": header.get("date_pulled"),
+            "report_type": "SOFT PULL CREDIT REPORT",
+        },
+        "report_summary": parse_report_summary(sections.get("REPORT SUMMARY", "")),
+        "personal_information": parse_personal_info(sections.get("PERSONAL INFORMATION", "")),
+        "credit_scores": parse_credit_score(sections.get("CREDIT SCORE", "")),
+        "address_history": parse_address_history(sections.get("ADDRESS HISTORY", "")),
+        "employment_history": parse_employment_history(sections.get("EMPLOYMENT HISTORY", "")),
+        "trade_accounts": parse_trade_accounts(sections.get("TRADE ACCOUNTS", "")),
+        "inquiries": parse_inquiries(sections.get("INQUIRIES", "")),
+        "collections": parse_collections(sections.get("COLLECTIONS", "")),
     }
 
+
+# ─────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────
 
 @app.post("/extract")
 async def extract_pdf(file: UploadFile = File(...)):
@@ -82,41 +465,68 @@ async def extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=f"No se pudo abrir el PDF: {str(e)}")
 
     meta = doc.metadata or {}
-    pages = []
-    full_text_parts = []
-
-    for i, page in enumerate(doc):
-        page_data = extract_page(page, i + 1)
-        pages.append(page_data)
-        if page_data["text"]:
-            full_text_parts.append(page_data["text"])
-
+    full_text = get_full_text(doc)
     doc.close()
+
+    structured = parse_credit_report(full_text)
 
     result = {
         "filename": file.filename,
-        "metadata": {
+        "pdf_metadata": {
             "title":    meta.get("title") or None,
-            "author":   meta.get("author") or None,
-            "subject":  meta.get("subject") or None,
             "creator":  meta.get("creator") or None,
             "producer": meta.get("producer") or None,
             "created":  meta.get("creationDate") or None,
-            "modified": meta.get("modDate") or None,
         },
-        "total_pages": len(pages),
-        "full_text": "\n\n".join(full_text_parts),
-        "pages": pages,
+        **structured,
     }
 
     return JSONResponse(content=result)
 
 
+@app.post("/extract/raw")
+async def extract_pdf_raw(file: UploadFile = File(...)):
+    """Returns raw text + blocks without parsing (original behavior)."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF.")
+
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Archivo demasiado grande. Máx 20 MB.")
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo abrir el PDF: {str(e)}")
+
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        blocks_raw = page.get_text("blocks")
+        blocks = []
+        for b in blocks_raw:
+            x0, y0, x1, y1, c, bn, bt = b
+            if c.strip():
+                blocks.append({"block": bn, "x0": round(x0,1), "y0": round(y0,1),
+                                "x1": round(x1,1), "y1": round(y1,1), "text": c.strip()})
+        pages.append({"page": i+1, "text": text, "blocks": blocks})
+
+    doc.close()
+    return JSONResponse(content={"filename": file.filename, "pages": pages})
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.get("/")
 async def root():
-    return {"message": "PDF → JSON API. POST /extract con un archivo PDF."}
+    return {
+        "message": "PDF → JSON API v2",
+        "endpoints": {
+            "POST /extract": "Extrae y parsea por secciones (reporte de crédito)",
+            "POST /extract/raw": "Extrae texto crudo con bloques y posiciones",
+            "GET /health": "Health check",
+        }
+    }
