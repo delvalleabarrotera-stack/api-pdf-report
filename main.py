@@ -213,41 +213,51 @@ def parse_credit_score(text):
 
 
 def parse_address_history(text):
+    """
+    PDF puts each field on its own line:
+      CURRENT
+      2168 BEACHWOOD DR
+      MERCED
+      CA 953483717
+      12-05-2023
+    We read the next 4 lines after each STATUS line.
+    """
     addresses = []
     ls = lines(text)
-    # skip header line
+
+    # Skip column-header rows (STATUS, STREET, CITY, STATE/ZIP, DATE REPORTED)
     start = 0
     for i, l in enumerate(ls):
-        if "STATUS" in l.upper() and "STREET" in l.upper():
+        if l.upper() in ("STATUS", "STREET", "CITY", "STATE/ZIP", "DATE REPORTED"):
             start = i + 1
+        elif l.upper() in ("CURRENT", "PREVIOUS"):
+            start = i
             break
+
     i = start
     while i < len(ls):
-        l = ls[i].upper()
-        if l.startswith("CURRENT") or l.startswith("PREVIOUS"):
-            status = "CURRENT" if l.startswith("CURRENT") else "PREVIOUS"
-            parts = ls[i].split()
-            # parts: STATUS STREET... CITY STATE/ZIP DATE
-            # find date at end (MM-DD-YYYY)
-            date = None
-            if re.match(r"\d{2}-\d{2}-\d{4}", parts[-1]):
-                date = parts[-1]
-                parts = parts[:-1]
-            # find state/zip (CA XXXXXXX pattern)
-            state_zip = None
-            for j in range(len(parts)-1, 0, -1):
-                if re.match(r"[A-Z]{2}", parts[j-1]) and re.match(r"\d+", parts[j]):
-                    state_zip = parts[j-1] + " " + parts[j]
-                    parts = parts[:j-1]
-                    break
-            street_city = " ".join(parts[1:])  # remove STATUS
+        status_raw = ls[i].upper().strip()
+        if status_raw in ("CURRENT", "PREVIOUS"):
+            status = status_raw
+            street     = ls[i+1] if i+1 < len(ls) else None
+            city       = ls[i+2] if i+2 < len(ls) else None
+            state_zip  = ls[i+3] if i+3 < len(ls) else None
+            date       = ls[i+4] if i+4 < len(ls) else None
+
+            # validate date format; if it doesn't match shift fields
+            if date and not re.match(r"\d{2}-\d{2}-\d{4}", date):
+                date = None
+
             addresses.append({
                 "status": status,
-                "address": clean(street_city),
+                "street": clean(street),
+                "city": clean(city),
                 "state_zip": clean(state_zip),
                 "date_reported": clean(date),
             })
-        i += 1
+            i += 5  # skip the 4 field lines + move past status
+        else:
+            i += 1
     return addresses
 
 
