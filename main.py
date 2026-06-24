@@ -328,7 +328,10 @@ def parse_trade_accounts(text):
         if not ls or "FURNISHER" not in ls[0].upper():
             continue
 
-        # Filter out payment pattern lines (sequences of numbers/letters like "9 5 5 4 3 C C C")
+        # First line is the company name (shows as "FURNISHER" when masked)
+        company = ls[0].strip()
+
+        # Filter out payment pattern lines (sequences like "9 5 5 4 3 C C C")
         data_lines = [l for l in ls[1:] if not re.match(r"^[\d\s\w]{2,}$", l) or
                       any(k in l.upper() for k in [
                           "CLOSED", "OPEN", "ACCOUNT", "CREDIT", "REVOLVING",
@@ -337,8 +340,7 @@ def parse_trade_accounts(text):
                           "SIGNER", "CHARGE", "AUTO", "UNSECURED",
                       ])]
 
-        acc = {}
-        i = 0
+        acc = {"company": company}
         field_idx = 0
 
         # Simple sequential parser: match non-pattern lines to fields in order
