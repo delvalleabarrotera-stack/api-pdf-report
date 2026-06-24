@@ -262,27 +262,45 @@ def parse_address_history(text):
 
 
 def parse_employment_history(text):
+    """
+    PDF puts each field on its own line:
+      CURRENT
+      CALICO
+      N/A        <- occupation (usually N/A)
+      12-07-2023
+    """
     jobs = []
     ls = lines(text)
+
+    # Skip header rows
     start = 0
     for i, l in enumerate(ls):
-        if "STATUS" in l.upper() and "NAME" in l.upper():
+        if l.upper() in ("STATUS", "NAME", "OCCUPATION", "DATE REPORTED"):
             start = i + 1
+        elif l.upper() in ("CURRENT", "PREVIOUS"):
+            start = i
             break
-    for line in ls[start:]:
-        parts = line.split()
-        if not parts:
-            continue
-        status = parts[0].upper()
-        if status in ("CURRENT", "PREVIOUS"):
-            date = parts[-1] if re.match(r"\d{2}-\d{2}-\d{4}", parts[-1]) else None
-            occ_idx = -2 if date else -1
-            employer = " ".join(parts[1:occ_idx]) if len(parts) > 2 else None
+
+    i = start
+    while i < len(ls):
+        status_raw = ls[i].upper().strip()
+        if status_raw in ("CURRENT", "PREVIOUS"):
+            employer   = ls[i+1] if i+1 < len(ls) else None
+            occupation = ls[i+2] if i+2 < len(ls) else None
+            date       = ls[i+3] if i+3 < len(ls) else None
+
+            if date and not re.match(r"\d{2}-\d{2}-\d{4}", date):
+                date = None
+
             jobs.append({
-                "status": status,
+                "status": status_raw,
                 "employer": clean(employer),
+                "occupation": clean(occupation),
                 "date_reported": clean(date),
             })
+            i += 4
+        else:
+            i += 1
     return jobs
 
 
