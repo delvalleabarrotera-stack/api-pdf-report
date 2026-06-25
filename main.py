@@ -103,37 +103,71 @@ def parse_header(text):
 
 
 def parse_report_summary(text):
-    """Parse key:value pairs from the summary block."""
+    """
+    Handles two PDF layouts:
+    Layout A — each field on its own line:
+        INQUIRIES:
+        30
+    Layout B — two columns joined per line:
+        INQUIRIES: 30  NEWEST OPEN: 11/21/2025
+    """
     mapping = {
-        "INQUIRIES": "inquiries",
-        "NEWEST OPEN": "newest_open",
-        "COLLECTIONS": "collections",
-        "OLDEST OPEN": "oldest_open",
-        "PUBLIC RECORDS": "public_records",
-        "MONTHLY PAYMENTS": "monthly_payments",
-        "30/60/90": "delinquency_30_60_90",
-        "BALANCE": "balance",
-        "ACCOUNTS": "accounts_total",
-        "CREDIT LIMIT": "credit_limit",
-        "OPEN ACCOUNTS": "open_accounts",
-        "AVAILABLE CREDIT": "available_credit",
-        "CLOSED ACCOUNTS": "closed_accounts",
+        "INQUIRIES":         "inquiries",
+        "NEWEST OPEN":       "newest_open",
+        "COLLECTIONS":       "collections",
+        "OLDEST OPEN":       "oldest_open",
+        "PUBLIC RECORDS":    "public_records",
+        "MONTHLY PAYMENTS":  "monthly_payments",
+        "30/60/90":          "delinquency_30_60_90",
+        "BALANCE":           "balance",
+        "ACCOUNTS":          "accounts_total",
+        "CREDIT LIMIT":      "credit_limit",
+        "OPEN ACCOUNTS":     "open_accounts",
+        "AVAILABLE CREDIT":  "available_credit",
+        "CLOSED ACCOUNTS":   "closed_accounts",
         "UTILIZATION RATIO": "utilization_ratio",
     }
     result = {}
+
+    # Strategy 1: line-by-line (layout A)
     ls = lines(text)
     i = 0
     while i < len(ls):
         for key, field in mapping.items():
-            if ls[i].upper().startswith(key):
-                # value is next line or same line after colon
-                raw = ls[i].split(":", 1)[-1].strip() if ":" in ls[i] else ""
-                if not raw and i + 1 < len(ls):
-                    raw = ls[i + 1]
-                    i += 1
-                result[field] = clean(raw)
+            line_up = ls[i].upper()
+            if line_up.startswith(key):
+                after_key = ls[i][len(key):].strip().lstrip(":").strip()
+                if after_key and after_key not in ("-", ""):
+                    result[field] = clean(after_key.split()[0])
+                elif i + 1 < len(ls):
+                    nxt = ls[i + 1].strip()
+                    if nxt and not any(nxt.upper().startswith(k) for k in mapping):
+                        result[field] = clean(nxt)
+                        i += 1
                 break
         i += 1
+
+    # Strategy 2: regex on raw text (layout B — fills gaps)
+    inline_patterns = [
+        (r"INQUIRIES[:\s]+(\d+)",          "inquiries"),
+        (r"NEWEST OPEN[:\s]+([\d/]+)",      "newest_open"),
+        (r"COLLECTIONS[:\s]+(\d+)",         "collections"),
+        (r"OLDEST OPEN[:\s]+([\d/]+)",      "oldest_open"),
+        (r"PUBLIC RECORDS[:\s]+(\d+)",      "public_records"),
+        (r"30/60/90[:\s]+([\d/]+)",         "delinquency_30_60_90"),
+        (r"OPEN ACCOUNTS[:\s]+(\d+)",       "open_accounts"),
+        (r"CLOSED ACCOUNTS[:\s]+(\d+)",     "closed_accounts"),
+        (r"\bACCOUNTS[:\s]+(\d+)",         "accounts_total"),
+    ]
+    text_up = text.upper()
+    for pattern, field in inline_patterns:
+        if not result.get(field):
+            m = re.search(pattern, text_up)
+            if m:
+                val = clean(m.group(1))
+                if val and val not in ("-",):
+                    result[field] = val
+
     return result
 
 
