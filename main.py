@@ -58,6 +58,11 @@ def get_full_text(doc):
 # Section splitter
 # ─────────────────────────────────────────
 
+# Section headers in the order they appear in the PDF
+# NOTE: "INQUIRIES" appears both as a summary field label AND as a section header.
+# We use a position-based split so "INQUIRIES:" inside REPORT SUMMARY is not confused
+# with the "INQUIRIES" section header (which appears on its own line between TRADE ACCOUNTS
+# and COLLECTIONS).
 SECTION_HEADERS = [
     "REPORT SUMMARY",
     "PERSONAL INFORMATION",
@@ -70,20 +75,34 @@ SECTION_HEADERS = [
 ]
 
 def split_sections(full_text):
-    """Split full text into named sections."""
-    pattern = "(" + "|".join(re.escape(h) for h in SECTION_HEADERS) + ")"
-    parts = re.split(pattern, full_text)
-    sections = {}
-    current = "HEADER"
-    buf = []
-    for part in parts:
-        if part in SECTION_HEADERS:
-            sections[current] = "\n".join(buf).strip()
-            current = part
-            buf = []
-        else:
-            buf.append(part)
-    sections[current] = "\n".join(buf).strip()
+    """
+    Split by section headers using their positions in order.
+    This avoids false matches (e.g. 'INQUIRIES:' inside REPORT SUMMARY).
+    Only matches headers that appear as a standalone line (no colon after them).
+    """
+    # Build a pattern that matches a header ONLY when it is on its own line
+    # (not followed by : on the same line, which would be a field label)
+    header_pattern = re.compile(
+        r'(?m)^(REPORT SUMMARY|PERSONAL INFORMATION|CREDIT SCORE|'
+        r'ADDRESS HISTORY|EMPLOYMENT HISTORY|TRADE ACCOUNTS|'
+        r'(?<!\S)INQUIRIES(?!\s*:)|COLLECTIONS)\s*$'
+    )
+
+    # Find all matches with their positions
+    matches = list(header_pattern.finditer(full_text))
+
+    sections = {"HEADER": ""}
+
+    # Text before the first header
+    if matches:
+        sections["HEADER"] = full_text[:matches[0].start()].strip()
+
+    for idx, match in enumerate(matches):
+        header = match.group(1).strip()
+        start  = match.end()
+        end    = matches[idx + 1].start() if idx + 1 < len(matches) else len(full_text)
+        sections[header] = full_text[start:end].strip()
+
     return sections
 
 
