@@ -1,11 +1,9 @@
 import re
 import fitz
-import requests
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 app = FastAPI(title="PDF → JSON Extractor (Free)", version="2.0.0")
 
@@ -60,6 +58,11 @@ def get_full_text(doc):
 # Section splitter
 # ─────────────────────────────────────────
 
+# Section headers in the order they appear in the PDF
+# NOTE: "INQUIRIES" appears both as a summary field label AND as a section header.
+# We use a position-based split so "INQUIRIES:" inside REPORT SUMMARY is not confused
+# with the "INQUIRIES" section header (which appears on its own line between TRADE ACCOUNTS
+# and COLLECTIONS).
 SECTION_HEADERS = [
     "REPORT SUMMARY",
     "PERSONAL INFORMATION",
@@ -72,20 +75,34 @@ SECTION_HEADERS = [
 ]
 
 def split_sections(full_text):
+    """
+    Split by section headers using their positions in order.
+    This avoids false matches (e.g. 'INQUIRIES:' inside REPORT SUMMARY).
+    Only matches headers that appear as a standalone line (no colon after them).
+    """
+    # Build a pattern that matches a header ONLY when it is on its own line
+    # (not followed by : on the same line, which would be a field label)
     header_pattern = re.compile(
         r'(?m)^(REPORT SUMMARY|PERSONAL INFORMATION|CREDIT SCORE|'
         r'ADDRESS HISTORY|EMPLOYMENT HISTORY|TRADE ACCOUNTS|'
         r'(?<!\S)INQUIRIES(?!\s*:)|COLLECTIONS)\s*$'
     )
+
+    # Find all matches with their positions
     matches = list(header_pattern.finditer(full_text))
+
     sections = {"HEADER": ""}
+
+    # Text before the first header
     if matches:
         sections["HEADER"] = full_text[:matches[0].start()].strip()
+
     for idx, match in enumerate(matches):
         header = match.group(1).strip()
         start  = match.end()
         end    = matches[idx + 1].start() if idx + 1 < len(matches) else len(full_text)
         sections[header] = full_text[start:end].strip()
+
     return sections
 
 
@@ -94,6 +111,7 @@ def split_sections(full_text):
 # ─────────────────────────────────────────
 
 def parse_header(text):
+    """Extract name and date from the document header."""
     result = {}
     for line in lines(text):
         if "DATE PULLED:" in line:
@@ -104,6 +122,14 @@ def parse_header(text):
 
 
 def parse_report_summary(text):
+    """
+    Handles two PDF layouts:
+    Layout A — each field on its own line:
+        INQUIRIES:
+        30
+    Layout B — two columns joined per line:
+        INQUIRIES: 30  NEWEST OPEN: 11/21/2025
+    """
     mapping = {
         "INQUIRIES":         "inquiries",
         "NEWEST OPEN":       "newest_open",
@@ -122,6 +148,7 @@ def parse_report_summary(text):
     }
     result = {}
 
+    # Strategy 1: line-by-line (layout A)
     ls = lines(text)
     i = 0
     while i < len(ls):
@@ -139,6 +166,7 @@ def parse_report_summary(text):
                 break
         i += 1
 
+    # Strategy 2: regex on raw text (layout B — fills gaps)
     inline_patterns = [
         (r"INQUIRIES[:\s]+(\d+)",          "inquiries"),
         (r"NEWEST OPEN[:\s]+([\d/]+)",      "newest_open"),
@@ -179,6 +207,7 @@ def parse_personal_info(text):
             result["aka"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
         elif u.startswith("PHONE:"):
             result["phone"] = clean(line.split(":", 1)[-1].strip() or (ls[i+1] if i+1 < len(ls) else None))
+    # fallback: parse inline pairs
     if not result:
         combined = " ".join(ls)
         for pat, field in [
@@ -197,6 +226,7 @@ def parse_personal_info(text):
 def parse_credit_score(text):
     scores = []
     ls = lines(text)
+    # skip header row
     i = 0
     while i < len(ls):
         line = ls[i].upper()
@@ -211,10 +241,12 @@ def parse_credit_score(text):
                     score_val = int(ls[j].strip())
                     j += 1
                     break
+                # score might be on same line
                 m = re.search(r"\b(\d{3})\b", ls[i])
                 if m:
                     score_val = int(m.group(1))
                 break
+            # collect reason codes until next model or end
             while j < len(ls):
                 l = ls[j]
                 if "FICO" in l.upper() or "VANTAGE" in l.upper() or "N/A" == l.upper():
@@ -234,8 +266,19 @@ def parse_credit_score(text):
 
 
 def parse_address_history(text):
+    """
+    PDF puts each field on its own line:
+      CURRENT
+      2168 BEACHWOOD DR
+      MERCED
+      CA 953483717
+      12-05-2023
+    We read the next 4 lines after each STATUS line.
+    """
     addresses = []
     ls = lines(text)
+
+    # Skip column-header rows (STATUS, STREET, CITY, STATE/ZIP, DATE REPORTED)
     start = 0
     for i, l in enumerate(ls):
         if l.upper() in ("STATUS", "STREET", "CITY", "STATE/ZIP", "DATE REPORTED"):
@@ -243,32 +286,46 @@ def parse_address_history(text):
         elif l.upper() in ("CURRENT", "PREVIOUS"):
             start = i
             break
+
     i = start
     while i < len(ls):
         status_raw = ls[i].upper().strip()
         if status_raw in ("CURRENT", "PREVIOUS"):
-            street    = ls[i+1] if i+1 < len(ls) else None
-            city      = ls[i+2] if i+2 < len(ls) else None
-            state_zip = ls[i+3] if i+3 < len(ls) else None
-            date      = ls[i+4] if i+4 < len(ls) else None
+            status = status_raw
+            street     = ls[i+1] if i+1 < len(ls) else None
+            city       = ls[i+2] if i+2 < len(ls) else None
+            state_zip  = ls[i+3] if i+3 < len(ls) else None
+            date       = ls[i+4] if i+4 < len(ls) else None
+
+            # validate date format; if it doesn't match shift fields
             if date and not re.match(r"\d{2}-\d{2}-\d{4}", date):
                 date = None
+
             addresses.append({
-                "status":        status_raw,
-                "street":        clean(street),
-                "city":          clean(city),
-                "state_zip":     clean(state_zip),
+                "status": status,
+                "street": clean(street),
+                "city": clean(city),
+                "state_zip": clean(state_zip),
                 "date_reported": clean(date),
             })
-            i += 5
+            i += 5  # skip the 4 field lines + move past status
         else:
             i += 1
     return addresses
 
 
 def parse_employment_history(text):
+    """
+    PDF puts each field on its own line:
+      CURRENT
+      CALICO
+      N/A        <- occupation (usually N/A)
+      12-07-2023
+    """
     jobs = []
     ls = lines(text)
+
+    # Skip header rows
     start = 0
     for i, l in enumerate(ls):
         if l.upper() in ("STATUS", "NAME", "OCCUPATION", "DATE REPORTED"):
@@ -276,6 +333,7 @@ def parse_employment_history(text):
         elif l.upper() in ("CURRENT", "PREVIOUS"):
             start = i
             break
+
     i = start
     while i < len(ls):
         status_raw = ls[i].upper().strip()
@@ -283,12 +341,14 @@ def parse_employment_history(text):
             employer   = ls[i+1] if i+1 < len(ls) else None
             occupation = ls[i+2] if i+2 < len(ls) else None
             date       = ls[i+3] if i+3 < len(ls) else None
+
             if date and not re.match(r"\d{2}-\d{2}-\d{4}", date):
                 date = None
+
             jobs.append({
-                "status":        status_raw,
-                "employer":      clean(employer),
-                "occupation":    clean(occupation),
+                "status": status_raw,
+                "employer": clean(employer),
+                "occupation": clean(occupation),
                 "date_reported": clean(date),
             })
             i += 4
@@ -298,8 +358,12 @@ def parse_employment_history(text):
 
 
 def parse_trade_accounts(text):
+    """Parse repeating FURNISHER blocks from trade accounts."""
     accounts = []
+
+    # Each account starts with a FURNISHER line
     blocks = re.split(r"(?=\bFURNISHER\b)", text)
+
     ACCOUNT_FIELDS = [
         "reported_date", "closure_date", "acc_status", "acc_rating",
         "acc_number", "pymt_history_start", "pymt_pattern", "remarks",
@@ -311,11 +375,16 @@ def parse_trade_accounts(text):
         "bln_due_amt", "bln_due_date", "months_reviewed",
         "delinquency_30_60_90", "max_delinquency_date",
     ]
+
     for block in blocks:
         ls = [l.strip() for l in block.splitlines() if l.strip()]
         if not ls or "FURNISHER" not in ls[0].upper():
             continue
+
+        # First line is the company name (shows as "FURNISHER" when masked)
         company = ls[0].strip()
+
+        # Filter out payment pattern lines (sequences like "9 5 5 4 3 C C C")
         data_lines = [l for l in ls[1:] if not re.match(r"^[\d\s\w]{2,}$", l) or
                       any(k in l.upper() for k in [
                           "CLOSED", "OPEN", "ACCOUNT", "CREDIT", "REVOLVING",
@@ -323,15 +392,20 @@ def parse_trade_accounts(text):
                           "FURNISHER", "REQUIRED", "LENDER", "PURCHASED",
                           "SIGNER", "CHARGE", "AUTO", "UNSECURED",
                       ])]
+
         acc = {"company": company}
         field_idx = 0
+
+        # Simple sequential parser: match non-pattern lines to fields in order
         for line in data_lines:
             if field_idx >= len(ACCOUNT_FIELDS):
                 break
             field = ACCOUNT_FIELDS[field_idx]
+            # Skip payment pattern sequences
             if re.match(r"^[0-9BCEUR ]{5,}$", line):
                 continue
             val = clean(line)
+            # Try to parse numbers for amount fields
             if field in ("org_loan_amt", "high_balance", "balance", "high_credit",
                          "credit_limit", "monthly_pymt", "actual_pymt", "past_due",
                          "recent_pymt", "bln_due_amt"):
@@ -344,8 +418,10 @@ def parse_trade_accounts(text):
             else:
                 acc[field] = val
             field_idx += 1
+
         if acc:
             accounts.append(acc)
+
     return accounts
 
 
@@ -360,6 +436,7 @@ def parse_inquiries(text):
     for line in ls[start:]:
         parts = line.split()
         if len(parts) >= 2 and re.match(r"\d{2}-\d{2}-\d{4}", parts[-2] if len(parts) >= 3 else parts[-1]):
+            # last token might be industry or date
             date_idx = None
             for j, p in enumerate(parts):
                 if re.match(r"\d{2}-\d{2}-\d{4}", p):
@@ -367,12 +444,12 @@ def parse_inquiries(text):
                     break
             if date_idx is None:
                 continue
-            company  = " ".join(parts[:date_idx])
-            date     = parts[date_idx]
+            company = " ".join(parts[:date_idx])
+            date = parts[date_idx]
             industry = " ".join(parts[date_idx+1:]) if date_idx + 1 < len(parts) else None
             inquiries.append({
-                "company":  clean(company),
-                "date":     clean(date),
+                "company": clean(company),
+                "date": clean(date),
                 "industry": clean(industry),
             })
     return inquiries
@@ -381,10 +458,13 @@ def parse_inquiries(text):
 def parse_collections(text):
     collections = []
     ls = lines(text)
+    # Skip header rows
     start = 0
     for i, l in enumerate(ls):
         if "SUBSCRIBER" in l.upper() or "ORGN. CRED" in l.upper():
             start = i + 1
+
+    # Group lines into collection entries (each starts with FURNISHER)
     blocks = re.split(r"(?=\bFURNISHER\b)", "\n".join(ls[start:]))
     for block in blocks:
         bls = [l.strip() for l in block.splitlines() if l.strip()]
@@ -428,46 +508,25 @@ def parse_collections(text):
 
 def parse_credit_report(full_text):
     sections = split_sections(full_text)
-    header   = parse_header(sections.get("HEADER", ""))
+
+    header_text = sections.get("HEADER", "")
+    header = parse_header(header_text)
+
     return {
         "report_info": {
             "subject_name": header.get("name"),
-            "date_pulled":  header.get("date_pulled"),
-            "report_type":  "SOFT PULL CREDIT REPORT",
+            "date_pulled": header.get("date_pulled"),
+            "report_type": "SOFT PULL CREDIT REPORT",
         },
-        "report_summary":       parse_report_summary(sections.get("REPORT SUMMARY", "")),
+        "report_summary": parse_report_summary(sections.get("REPORT SUMMARY", "")),
         "personal_information": parse_personal_info(sections.get("PERSONAL INFORMATION", "")),
-        "credit_scores":        parse_credit_score(sections.get("CREDIT SCORE", "")),
-        "address_history":      parse_address_history(sections.get("ADDRESS HISTORY", "")),
-        "employment_history":   parse_employment_history(sections.get("EMPLOYMENT HISTORY", "")),
-        "trade_accounts":       parse_trade_accounts(sections.get("TRADE ACCOUNTS", "")),
-        "inquiries":            parse_inquiries(sections.get("INQUIRIES", "")),
-        "collections":          parse_collections(sections.get("COLLECTIONS", "")),
+        "credit_scores": parse_credit_score(sections.get("CREDIT SCORE", "")),
+        "address_history": parse_address_history(sections.get("ADDRESS HISTORY", "")),
+        "employment_history": parse_employment_history(sections.get("EMPLOYMENT HISTORY", "")),
+        "trade_accounts": parse_trade_accounts(sections.get("TRADE ACCOUNTS", "")),
+        "inquiries": parse_inquiries(sections.get("INQUIRIES", "")),
+        "collections": parse_collections(sections.get("COLLECTIONS", "")),
     }
-
-
-# ─────────────────────────────────────────
-# Shared helpers for endpoints
-# ─────────────────────────────────────────
-
-def _build_result(filename: str, doc, structured: dict) -> dict:
-    meta = doc.metadata or {}
-    return {
-        "filename": filename,
-        "pdf_metadata": {
-            "title":    meta.get("title") or None,
-            "creator":  meta.get("creator") or None,
-            "producer": meta.get("producer") or None,
-            "created":  meta.get("creationDate") or None,
-        },
-        **structured,
-    }
-
-def _open_pdf(content: bytes):
-    try:
-        return fitz.open(stream=content, filetype="pdf")
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not open PDF: {str(e)}")
 
 
 # ─────────────────────────────────────────
@@ -477,73 +536,64 @@ def _open_pdf(content: bytes):
 @app.post("/extract")
 async def extract_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF.")
+
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Max 20 MB.")
-    doc = _open_pdf(content)
-    full_text  = get_full_text(doc)
-    structured = parse_credit_report(full_text)
-    result     = _build_result(file.filename, doc, structured)
-    doc.close()
-    return JSONResponse(content=result)
-
-
-class UrlRequest(BaseModel):
-    url: str
-    session_cookie: str | None = None
-
-@app.post("/extract_url")
-async def extract_pdf_url(body: UrlRequest):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if body.session_cookie:
-        headers["Cookie"] = body.session_cookie
+        raise HTTPException(status_code=400, detail="Archivo demasiado grande. Máx 20 MB.")
 
     try:
-        r = requests.get(body.url, headers=headers, timeout=30)
+        doc = fitz.open(stream=content, filetype="pdf")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"No se pudo abrir el PDF: {str(e)}")
 
-    if r.status_code in (401, 403):
-        raise HTTPException(status_code=403, detail="URL requires authentication")
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"URL returned {r.status_code}")
-    if "application/pdf" not in r.headers.get("content-type", ""):
-        raise HTTPException(status_code=422, detail="URL did not return a PDF")
-
-    doc = _open_pdf(r.content)
-    full_text  = get_full_text(doc)
-    structured = parse_credit_report(full_text)
-    filename   = body.url.split("/")[-1].split("?")[0] or "report.pdf"
-    result     = _build_result(filename, doc, structured)
+    meta = doc.metadata or {}
+    full_text = get_full_text(doc)
     doc.close()
+
+    structured = parse_credit_report(full_text)
+
+    result = {
+        "filename": file.filename,
+        "pdf_metadata": {
+            "title":    meta.get("title") or None,
+            "creator":  meta.get("creator") or None,
+            "producer": meta.get("producer") or None,
+            "created":  meta.get("creationDate") or None,
+        },
+        **structured,
+    }
+
     return JSONResponse(content=result)
 
 
 @app.post("/extract/raw")
 async def extract_pdf_raw(file: UploadFile = File(...)):
-    """Returns raw text + blocks without parsing."""
+    """Returns raw text + blocks without parsing (original behavior)."""
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF.")
+
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Max 20 MB.")
-    doc = _open_pdf(content)
+        raise HTTPException(status_code=400, detail="Archivo demasiado grande. Máx 20 MB.")
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo abrir el PDF: {str(e)}")
+
     pages = []
     for i, page in enumerate(doc):
-        text       = page.get_text("text").strip()
+        text = page.get_text("text").strip()
         blocks_raw = page.get_text("blocks")
         blocks = []
         for b in blocks_raw:
             x0, y0, x1, y1, c, bn, bt = b
             if c.strip():
-                blocks.append({
-                    "block": bn,
-                    "x0": round(x0, 1), "y0": round(y0, 1),
-                    "x1": round(x1, 1), "y1": round(y1, 1),
-                    "text": c.strip(),
-                })
-        pages.append({"page": i + 1, "text": text, "blocks": blocks})
+                blocks.append({"block": bn, "x0": round(x0,1), "y0": round(y0,1),
+                                "x1": round(x1,1), "y1": round(y1,1), "text": c.strip()})
+        pages.append({"page": i+1, "text": text, "blocks": blocks})
+
     doc.close()
     return JSONResponse(content={"filename": file.filename, "pages": pages})
 
@@ -558,9 +608,8 @@ async def root():
     return {
         "message": "PDF → JSON API v2",
         "endpoints": {
-            "POST /extract":     "Parse credit report PDF into structured JSON",
-            "POST /extract_url": "Fetch PDF from URL and parse (supports session_cookie)",
-            "POST /extract/raw": "Extract raw text and block positions",
-            "GET  /health":      "Health check",
+            "POST /extract": "Extrae y parsea por secciones (reporte de crédito)",
+            "POST /extract/raw": "Extrae texto crudo con bloques y posiciones",
+            "GET /health": "Health check",
         }
     }
